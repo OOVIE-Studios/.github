@@ -1,0 +1,159 @@
+name: Claude Review (reusable)
+
+# Central reusable review workflow for all OOVIE-Studios repos.
+# Callers add a ~20-line wrapper that points `uses:` here. Prompt
+# tweaks and action-version bumps happen in this one file.
+
+on:
+  workflow_call:
+    inputs:
+      prompt_context:
+        description: >-
+          Optional repo-specific context injected into the review prompt
+          (e.g. "This repo uses an apps/* workspace layout.").
+        type: string
+        required: false
+        default: ""
+      model:
+        description: Model passed to claude-code-action.
+        type: string
+        required: false
+        default: claude-sonnet-4-6
+      max_turns:
+        type: string
+        required: false
+        default: "30"
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: true
+      # oovie-dev service-account PAT. Added to CODEOWNERS so the formal
+      # review counts toward branch protection / auto-merge. If absent,
+      # the review still runs and comments; only the formal approval is
+      # skipped.
+      OOVIE_DEV_TOKEN:
+        required: false
+
+jobs:
+  review:
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Claude review
+        id: claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            Review this pull request as a senior engineer.
+
+            Start by reading CLAUDE.md (and any rules files it points to)
+            if the repo has one, so you apply the project's own
+            conventions, not generic best practice. ${{ inputs.prompt_context }}
+            Then read the PR diff and the surrounding code it touches.
+
+            Categorize every issue you find as either [BLOCKING] or
+            [NIT]. Be strict about what counts as BLOCKING — most
+            review feedback should be NIT and should not block the
+            merge.
+
+            [BLOCKING] — the PR must not merge as-is. Reserve for:
+              - Correctness bugs the diff actually introduces (races,
+                null / undefined handling, broken error paths real
+                callers will hit)
+              - Security: auth bypass, secrets in code, missing input
+                validation, XSS, CORS holes, IDOR, command / SQL
+                injection, dependency CVEs the diff introduces
+              - Data loss or migration risk: destructive migrations
+                without rollback, breaking API shape callers don't
+                yet handle
+              - Breaking changes the PR description doesn't document
+                (env vars, deploy manifests, public function
+                signatures, response shapes)
+              - The PR description claiming something the diff doesn't
+                actually do
+
+            [NIT] — everything else: readability, naming, "could be
+            cleaner", nice-to-have extra tests, comment phrasing,
+            minor refactors. Skip anything the linter already covers.
+
+            When in doubt, prefer [NIT]. If the worst realistic
+            outcome of merging as-is is "future-us tidies it up",
+            it's a nit, not blocking.
+
+            Write the review as a flat bullet list. Each bullet
+            starts with [BLOCKING] or [NIT] and gives one line of
+            context (file:line where useful). Aim for ≤12 bullets
+            total; if you have more nits than that, group or drop
+            the smallest ones. No preamble, no closing paragraph,
+            no recap of what the PR does — just the bullets.
+
+            MANDATORY FINAL ACTION — do not skip. You MUST write the
+            verdict file AND post the bullets using the Bash tool
+            before stopping. The verdict file drives the formal
+            GitHub review; without it the run is wasted.
+
+            Verdict rule (mechanical, no judgement call):
+              - Zero [BLOCKING] entries → APPROVE.
+              - One or more [BLOCKING] entries → REQUEST_CHANGES.
+
+            Run exactly one of:
+
+              echo 'VERDICT: APPROVE' > /tmp/claude-verdict.txt
+
+              echo 'VERDICT: REQUEST_CHANGES — <one-sentence reason>' > /tmp/claude-verdict.txt
+
+            Then post the bullet list:
+
+              gh pr comment ${{ github.event.pull_request.number }} --body "<your bullet list>"
+          claude_args: "--max-turns ${{ inputs.max_turns }} --model ${{ inputs.model }} --allowedTools Read,Glob,Grep,Bash"
+
+      - name: Submit formal review
+        if: always() && steps.claude.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.OOVIE_DEV_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "OOVIE_DEV_TOKEN not available to this repo; skipping formal review."
+            exit 0
+          fi
+
+          if [ ! -f /tmp/claude-verdict.txt ]; then
+            echo "No verdict file written; skipping formal review."
+            exit 0
+          fi
+
+          VERDICT_LINE=$(grep -E '^VERDICT:' /tmp/claude-verdict.txt | tail -1 || true)
+          if [ -z "$VERDICT_LINE" ]; then
+            echo "Verdict file present but no VERDICT: line; skipping."
+            exit 0
+          fi
+
+          case "$VERDICT_LINE" in
+            "VERDICT: APPROVE"*)
+              gh pr review "$PR_NUMBER" --repo "$REPO" --approve \
+                --body "Auto-approved by Claude review."
+              ;;
+            "VERDICT: REQUEST_CHANGES"*)
+              gh pr review "$PR_NUMBER" --repo "$REPO" --request-changes \
+                --body "$VERDICT_LINE"
+              ;;
+            *)
+              echo "Unrecognised verdict: $VERDICT_LINE"
+              gh pr review "$PR_NUMBER" --repo "$REPO" --comment \
+                --body "Claude review completed; verdict not recognised: $VERDICT_LINE"
+              ;;
+          esac

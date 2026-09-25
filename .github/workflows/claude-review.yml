@@ -20,9 +20,10 @@ on:
         required: false
         default: claude-sonnet-4-6
       max_turns:
+        # 30 ran out on a 113-file merge PR before the verdict was written.
         type: string
         required: false
-        default: "30"
+        default: "60"
     secrets:
       ANTHROPIC_API_KEY:
         required: true

@@ -37,7 +37,8 @@ jobs:
   review:
     if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Large diffs (merge PRs of 100+ files) need more than 15 minutes.
+    timeout-minutes: 30
     permissions:
       contents: read
       pull-requests: write
@@ -121,6 +122,9 @@ jobs:
         if: always() && steps.claude.outcome == 'success'
         env:
           GH_TOKEN: ${{ secrets.OOVIE_CI_TOKEN }}
+          # The workflow's own token: it cannot count as a CODEOWNERS
+          # approval, but it can still leave the verdict on the PR.
+          FALLBACK_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
         run: |
@@ -131,6 +135,15 @@ jobs:
             exit 0
           fi
 
+          # An expired or revoked PAT answers 401 on every call. Do not fail
+          # the check for that: warn, and post the verdict as a comment.
+          FORMAL=true
+          if ! gh api user --silent 2>/dev/null; then
+            echo "::warning::OOVIE_CI_TOKEN was rejected (expired or revoked). Posting the verdict as a comment instead of a formal review; renew the secret to restore it."
+            export GH_TOKEN="$FALLBACK_TOKEN"
+            FORMAL=false
+          fi
+
           if [ ! -f /tmp/claude-verdict.txt ]; then
             echo "No verdict file written; skipping formal review."
             exit 0
@@ -139,6 +152,12 @@ jobs:
           VERDICT_LINE=$(grep -E '^VERDICT:' /tmp/claude-verdict.txt | tail -1 || true)
           if [ -z "$VERDICT_LINE" ]; then
             echo "Verdict file present but no VERDICT: line; skipping."
+            exit 0
+          fi
+
+          if [ "$FORMAL" = false ]; then
+            gh pr comment "$PR_NUMBER" --repo "$REPO" \
+              --body "Claude review verdict (not a formal review — OOVIE_CI_TOKEN needs renewing): $VERDICT_LINE"
             exit 0
           fi
 
